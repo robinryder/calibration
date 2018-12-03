@@ -1,0 +1,254 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r include=F}
+library(pander)
+panderOptions('round', 2)
+panderOptions('digits', 3)
+panderOptions('p.wrap', '')
+knitr::opts_chunk$set(warning=F)
+```
+
+
+The point of this notebook is to evaluate the calibration of credible intervals given by Variational Bayes for a normal mixture model. 
+
+The data are iid
+\[ 
+X\sim p\mathcal N(\mu_1, 1) + (1-p)\mathcal N(\mu_2, 1)
+\]
+with $p<\frac12$ to ensure identifiability. The parameter of interest is $\mu_1$, the position of the smaller mode.
+
+Let's generate some toy data:
+```{r}
+n = 20
+mu1 = 3
+mu2 = 7
+p = 0.2
+
+synth.data = function(n, mu1, mu2, p, sigma=1){
+  clus = sample(c(1, 0), n, rep=T, prob=c(p, 1-p))
+  y = rnorm(n, mu1*clus + mu2*(1-clus), sigma)
+  y = matrix(y, ncol=1)
+  return(y)
+}
+
+y = synth.data(n, mu1, mu2, p)
+```
+
+```{r echo=F}
+require(ggplot2)
+ggplot(data.frame(y=y), aes(x=y)) + xlim(-2, 12) +
+  geom_histogram(bins=10, fill="lightblue", color="darkblue")
+```
+
+I'll use the [vabayelMix](https://github.com/cran/vabayelMix) package for variational inference. Annoyingly, the package is no longer on CRAN, but you can download the source code and load it manually.
+
+```{r}
+require(R.utils)
+sourceDirectory("vabayelMix-master/R/")
+```
+
+And now we can get a variational approximation of the posterior:
+```{r, results="hide"}
+outobs = vabayelMix(y, Ncat=2, nruns=1)
+```
+
+```{r, echo=F}
+outmu1 = outobs$estvals[[1]]$mean[1] 
+outmu2 = outobs$estvals[[1]]$mean[2] 
+outtau1 = outobs$estvals[[1]]$ivarm[1] 
+outtau2 = outobs$estvals[[1]]$ivarm[2]
+outp = outobs$estvals[[1]]$dapi[1]/sum(outobs$estvals[[1]]$dapi)
+outlowmu = outmu1 * (outp<.5) + outmu2 * (outp>=.5)
+outlowtau = outtau1 * (outp<.5) + outtau2 * (outp>=.5) 
+outhightau = outtau2 * (outp<.5) + outtau1 * (outp>=.5) 
+outsmallp = min(outp, 1-outp)
+```
+
+We can plot the approximate marginal posterior of $\mu_1$, which is essentially $\mathcal N(`r pander(outlowmu)`, `r pander(1/outlowtau)`)$.
+
+```{r echo=F}
+plotpost = ggplot(data = data.frame(x = 0), mapping = aes(x = x, color="VB")) +
+  stat_function(fun = function(x){dnorm(x, outlowmu, outlowtau^(-.5))}) +
+  xlim(-2, 12)
+plotpost
+```
+
+We can now compute an approximate 90% credible interval:
+```{r}
+credint = qnorm(c(.05, .95), outlowmu, outlowtau^(-.5))
+credint
+```
+[Note: you can be smarter about how you use the VB approximate joint posterior to get the approximate marginal of $\mu_1$, and get a slightly better approximate credible interval. In practice, the difference is negligible for this example, so I'll stick with this as the approximate CI.]
+
+
+Actually, in this case, we could sample from the posterior via MCMC, giving us the posterior exactly (up to Monte Carlo error). Let's check how good our approximate interval is.
+
+```{r results="hide"}
+require(bayesm)
+gibbswarmup = 100
+gibbsniter = 1000
+outgibbs = rnmixGibbs(list(y=y), list(ncomp=2), list(R=gibbsniter+gibbswarmup, nprint=0))
+```
+
+```{r echo=F}
+gibbsmu1 = sapply(outgibbs$nmix$compdraw, function(x){x[[1]]$mu})[-(1:gibbswarmup)]
+gibbsmu2 = sapply(outgibbs$nmix$compdraw, function(x){x[[2]]$mu})[-(1:gibbswarmup)]
+gibbsp = outgibbs$nmix$probdraw[-(1:gibbswarmup), 1]
+gibbslowmu = gibbsmu1 * (gibbsp<.5) + gibbsmu2 * (gibbsp>=.5)
+
+plotpost + layer(stat="density", data = data.frame(x = gibbslowmu), mapping = aes(x = x, color="Gibbs"), geom="path", position="identity")
+  
+```
+
+We had an approximate credible interval with nominal coverage $0.90$. What is the actual coverage of that interval?
+
+```{r}
+cov.by.gibbs = mean((gibbslowmu > credint[1]) & (gibbslowmu < credint[2]))
+```
+
+The actual coverage is `r cov.by.gibbs`.
+
+We have a problem: the approximate credible interval cannot be trusted! What should we do?
+
+In this specific example, we could decide to always use the Gibbs estimate. But that isn't practical: in many other examples, we won't have an MCMC sampler available. And we like the speed of the Variational Bayes estimate.
+
+```{r message=F, results="hide", warning=F, echo=F, cache=T}
+require(microbenchmark)
+mb = microbenchmark(invisible(captureOutput(vabayelMix(y, Ncat=2, nruns=1))), invisible(captureOutput(rnmixGibbs(list(y=y), list(ncomp=2), list(R=gibbsniter+gibbswarmup, nprint=0)))))
+
+captureOutput(autoplot(mb, log=F) + scale_x_discrete(labels =c("VB", "Gibbs")))
+```
+
+What we would love would be to keep the VB approximation, but estimate how good the credible interval is.
+
+```{r}
+niter = 1e4
+```
+
+
+Here goes. We are going to simulate `r pander(niter)` data sets; for each, we will get an approximate posterior, record whether the approximate credible interval covers the true value, and record some summary statistics such as $\hat\mu_1$ and $|\hat\mu_1-\hat\mu_2|$.
+
+```{r cache=T}
+simulations = as.data.frame(matrix(NA, nrow=niter, ncol=10, dimnames=list(NULL, c("mu1true", "mu2true", "ptrue", "mu1est", "mu2est", "ivar1est", "ivar2est", "pest", "mu1islow", "covers90"))))
+
+covers = function(truemean, estmean, ivar, p){
+  q = qnorm(c(p, 1-p), estmean, 1/sqrt(ivar))
+  return((truemean > q[1]) & (truemean<q[2]))
+}
+
+for(i in 1:niter){
+  mu1sim = rnorm(1, 0, 10)
+  mu2sim = rnorm(1, 0, 10)
+  psim = runif(1, 0, .5)
+  ysim = synth.data(n, mu1sim, mu2sim, psim)
+  invisible(captureOutput(outsim <- vabayelMix(ysim, Ncat=2, nruns=1)))
+  
+  pest = outsim$estvals[[1]]$dapi[1]/sum(outsim$estvals[[1]]$dapi)
+  if(pest < .5){
+    cov = covers(mu1sim, outsim$estvals[[1]]$mean[1], outsim$estvals[[1]]$ivarm[1], .05)
+    mu1islow = T
+  }
+  else{
+    cov = covers(mu1sim, outsim$estvals[[1]]$mean[2], outsim$estvals[[1]]$ivarm[2], .05)
+    mu1islow = F
+  }
+  simulations[i, ] = c(mu1sim, mu2sim, psim, outsim$estvals[[1]]$mean[1], outsim$estvals[[1]]$mean[2], outsim$estvals[[1]]$ivarm[1], outsim$estvals[[1]]$ivarm[2], pest, mu1islow, cov)
+}
+
+simulations$mudist = abs(simulations$mu1est - simulations$mu2est)
+simulations$smallpest = pmin(simulations$pest, 1-simulations$pest)
+simulations$mu1islow = as.logical(simulations$mu1islow)
+
+simulations$lowivar = simulations$ivar1est * simulations$mu1islow + simulations$ivar2est * (1-simulations$mu1islow)
+simulations$highivar = simulations$ivar2est * simulations$mu1islow + simulations$ivar1est * (1-simulations$mu1islow)
+
+simulations$lowmu = simulations$mu1est * simulations$mu1islow + simulations$mu2est * (1-simulations$mu1islow)
+simulations$highmu = simulations$mu2est * simulations$mu1islow + simulations$mu1est * (1-simulations$mu1islow)
+```
+
+Now we regress the coverage indicator against all our summary statistics. We don't expect the relationship to be linear, so we use a GAM.
+
+
+```{r results="hide"}
+require(mgcv)
+```
+
+
+```{r cache=T}
+reg.mgcv = gam(covers90 ~ s(mudist) + s(smallpest) + s(lowivar) + s(highivar) + s(I(1/lowivar)) + s(I(1/highivar)) + te(mudist, smallpest, lowivar), family="binomial", data=simulations)
+```
+
+If we compute the same summary statistics on our observations, we can use the regression to predict the coverage of our original approximate credible interval.
+
+```{r}
+obsdat = data.frame(mudist=abs(outmu1-outmu2), smallpest=outsmallp, lowivar=outlowtau, highivar=outhightau)
+cov.by.algo2 = predict(reg.mgcv, obsdat, type="response", se.fit=T)
+```
+
+To sum up: the nominal coverage is $0.90$.
+The true coverage according to MCMC is $`r pander(cov.by.gibbs)`$.
+Our estimate is $`r pander(unname(cov.by.algo2[["fit"]]))`$ 
+<!-- (95% interval: $[`r pander(unname(cov.by.algo2[["fit"]] - 1.96 * cov.by.algo2[["se.fit"]]))` \, ; \, `r pander(unname(cov.by.algo2[["fit"]] + 1.96 * cov.by.algo2[["se.fit"]]))`]$.) -->
+
+So our estimate approaches the truth much better than the nominal coverage. If you're like me, you want to repeat this experiment a bunch of times, just to check that we weren't lucky. Let's repeat the experiment on 1000 toy data sets. The good news is that the expensive part of the algorithm has already been done, so we don't need to run it again.
+
+```{r cache=T}
+ntest = 1e3
+cn = c("mu1", "mu2", "p", "mu1est", "mu2est", "pest", "ivar1est", "ivar2est", "covered", "gibbscovered")
+testmat = as.data.frame(matrix(NA, nrow=ntest, ncol=length(cn)))
+colnames(testmat) = cn
+
+for(i in 1:ntest){
+  mu1t = rnorm(1, 0, 10)
+  mu2t = rnorm(1, 0, 10)
+  pt = runif(1, 0, .5)
+  yt = synth.data(n, mu1t, mu2t, pt)
+  invisible(captureOutput(outt <- vabayelMix(yt, Ncat=2, nruns=1)))
+  
+  mu1estt = outt$estvals[[1]]$mean[1]
+  mu2estt = outt$estvals[[1]]$mean[2]
+  pestt = outt$estvals[[1]]$dapi[1]/sum(outt$estvals[[1]]$dapi)
+  
+  invisible(captureOutput(gibbsest <- rnmixGibbs(list(y=yt), list(ncomp=2), list(R=gibbsniter+gibbswarmup, nprint=0))))
+  gibbsmu1 = sapply(gibbsest$nmix$compdraw, function(x){x[[1]]$mu})[-(1:gibbswarmup)]
+  gibbsmu2 = sapply(gibbsest$nmix$compdraw, function(x){x[[2]]$mu})[-(1:gibbswarmup)]
+  gibbsp = gibbsest$nmix$probdraw[-(1:gibbswarmup), 1]
+  
+  gibbslowmu = gibbsmu1 * (gibbsp<.5) + gibbsmu2 * (gibbsp>=.5)
+  
+  if(pestt < .5){ 
+    covt = covers(mu1t, mu1estt, outt$estvals[[1]]$ivarm[1], .05)
+    gibbscovered = mean(sapply(gibbslowmu, function(x){ covers(x, mu1estt, outt$estvals[[1]]$ivarm[1], .05) }))
+  }
+  if(pestt >= .5){
+    covt = covers(mu1t, mu2estt, outt$estvals[[1]]$ivarm[2], .05)
+    gibbscovered = mean(sapply(gibbslowmu, function(x){ covers(x, mu2estt, outt$estvals[[1]]$ivarm[2], .05) }))
+  }
+  
+  testmat[i, ] = c(mu1t, mu2t, pt, mu1estt, mu2estt, pestt, outt$estvals[[1]]$ivarm, covt, gibbscovered)
+  
+}
+testmat$mudist = abs(testmat$mu1est - testmat$mu2est)
+testmat$smallpest = pmin(testmat$pest, 1-testmat$pest)
+testmat$mu1islow = (testmat$pest <.5)
+testmat$lowmu = testmat$mu1est * testmat$mu1islow + testmat$mu2est * (1-testmat$mu1islow)
+testmat$highmu = testmat$mu2est * testmat$mu1islow + testmat$mu1est * (1-testmat$mu1islow)
+testmat$lowivar = testmat$ivar1est * testmat$mu1islow + testmat$ivar2est * (1-testmat$mu1islow)
+testmat$highivar = testmat$ivar2est * testmat$mu1islow + testmat$ivar1est * (1-testmat$mu1islow)
+testmat$covestalgo1 = predict(reg.mgcv, testmat, type="response")
+```
+
+This plot shows the expected coverage against the "true" coverage of approximate credible intervals; note that most points are close to the $y=x$ red line. The green line corresponds to the nominal coverage of $0.90$, which is usually far from the true coverage.
+
+```{r echo=F}
+ggplot(testmat, aes(x=gibbscovered, y=covestalgo1)) + geom_point(shape=23) +
+  labs(y="Coverage estimated by Algorithm 1", x="Coverage according to Gibbs sampler") +
+  geom_abline(intercept=0, slope=1, color="red", size=1) +
+  geom_vline(xintercept=.9, color="darkgreen", size=1)
+```
+
